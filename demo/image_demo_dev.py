@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import os
 import cv2
 import torch
 import numpy as np
@@ -8,8 +9,8 @@ from mmengine.model import revert_sync_batchnorm
 
 from mmseg.apis import inference_model, init_model, show_result_pyplot
 
-config = "configs/point_rend/pointrend_r101_4xb2-80k_floorplan-512x1024.py"
-checkpoint = "work_dirs/pointrend_r101_4xb2-80k_floorplan-512x1024/iter_56000.pth"
+config = "configs/mask2former/mask2former_swin-b-in22k-384x384-pre_8xb2-90k_cityscapes_floorplan-512x1024.py"
+checkpoint = "work_dirs/mask2former_swin-b-in22k-384x384-pre_8xb2-90k_cityscapes_floorplan-512x1024/iter_90000.pth"
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 model = init_model(config, checkpoint, device=device)
 if device == 'cpu':
@@ -19,6 +20,40 @@ opacity = 1
 with_labels = False
 title = "result"
 img = "data/floorplan_point_rend/eval/300-499/newhouse317 Recovered NA.png"
+
+
+# Function to reduce contour points
+def reduce_contour_points(contours, epsilon_ratio=0.02):
+    reduced_contours = []
+    for contour in contours:
+        # Calculate epsilon as a fraction of the contour's perimeter
+        epsilon = epsilon_ratio * cv2.arcLength(contour, True)
+        # Approximate the contour
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        reduced_contours.append(approx)
+    return reduced_contours
+
+def dense_noisy_area(contour, density_threshold = 0.01):
+    area = cv2.contourArea(contour)
+    if area <= 0:
+        return True
+
+    # Calculate the number of points in the contour
+    num_points = len(contour)
+
+    # Calculate point density
+    density = num_points / area
+    print("Contour: density points: ", density)
+
+    # Check if density exceeds the threshold
+    if density > density_threshold:
+        return True
+
+def valid_reduced_contour(contour):
+    if dense_noisy_area(contour): #or far_noisy_area(contour) or long_noisy_area(contour):
+        return False
+    else:
+        return True
 
 
 def main():
@@ -50,6 +85,7 @@ def main():
 
     # build the model from a config file and a checkpoint file
     # test a single image
+    img_nm = img.split("/")[-1]
     image = cv2.imread(img)
     print("Image shape size: ", image.shape)
     result = inference_model(model, img)
@@ -99,6 +135,17 @@ def main():
     result = {}
     result["image_nm"] = img.split('/')[-1]
     result["annotations"] = []
+
+    # Draw the point (small circle)
+    point_color = (255, 0, 0)  # Red color in BGR
+    point_radius = 10  # Radius of the point
+    point_thickness = -1  # Fill the circle
+
+    new_result = {}
+    new_result["image_nm"] = img.split('/')[-1]
+    new_result["annotations"] = []
+
+
     for idx, cont in enumerate(contours):
         #print("Cont: ", cont)
         cont_inf = {}
@@ -126,7 +173,45 @@ def main():
         
         result["annotations"].append(cont_inf)
     
+
+    ############### contour reduction plotting ##################
+    # Reduce contour points
+    epsilon_ratio = 0.003  # Adjust this value as needed
+    reduced_contours = reduce_contour_points(contours, epsilon_ratio)
+    new_reduced_conts = []
+    height, width, _ = seg_img_rgb.shape
+
+    for contour in reduced_contours:
+        if valid_reduced_contour(contour):
+            red_cont_inf = {}
+            red_cont_inf["area_type"] = "indoor"
+            red_cont_inf["points"] = contour.tolist()
+            red_cont_inf["area"] = cv2.contourArea(contour)
+            red_cont_inf["reduced_points"] = len(contour.tolist())
+            #red_cont_inf["confidence"] = 0.64
+            new_result["annotations"].append(red_cont_inf)
+
+            cv2.drawContours(seg_img_rgb, [contour], -1, (2, 48, 32), 2)  # Reduced contours in red
+            for point in contour:
+                cv2.circle(seg_img_rgb, tuple(point[0]), 4, (255, 0, 0), -1)  # Mark reduced points in blue
+
+        else:
+            fill_color = (255, 255, 255)
+            xmin, ymin, w, h = cv2.boundingRect(contour)
+            for point in contour:
+                x, y = point[0]
+                dx = -3 if x < (xmin + (w//2)) else 3
+                dy = -3 if y < (ymin + (h//2)) else 3
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < width and 0 <= ny < height:
+                    b, g, r = seg_img_rgb[ny, nx]
+                    if tuple((b,g,r)) == tuple((0, 245, 0)):
+                        #print("Fill color green")
+                        fill_color = (0, 245, 0)
+            cv2.drawContours(seg_img_rgb, [contour], -1, fill_color, -1)  # noisy contours in white
+    
     output.append(result)
+    cv2.imwrite(os.path.join(save_dir, "Clean_recovered_" + img_nm, ".png"), seg_img_rgb)
 
     print(output)
     
